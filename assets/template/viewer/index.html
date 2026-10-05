@@ -1,0 +1,181 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>Enclosure preview</title>
+<!-- Live preview for build123d enclosure projects (design-enclosure).
+     Reads scene.json + part_*.glb written by preview.py, reloads every 1.5 s.
+     Sections tab reads sections/index.json written by sections.py.
+     Console API: setView('iso'|'top'|'front'|'back'|'left'|'right'|'bottom'), cutAt('x'|'y'|'z', mm, flip),
+     clipAt(nx,ny,nz,d), noClip(), look(px,py,pz, tx,ty,tz), show(label, on), open2d(). -->
+<style>
+ :root{--bg:#f3f4f6;--fg:#111;--panel:#ffffffd9}
+ @media (prefers-color-scheme: dark){:root{--bg:#1c1d20;--fg:#eee;--panel:#2a2b2fd9}}
+ html,body{margin:0;height:100%;background:var(--bg);color:var(--fg);font:13px system-ui,sans-serif;overflow:hidden}
+ #hud{position:absolute;top:8px;left:8px;background:var(--panel);padding:8px 10px;border-radius:8px;max-width:340px;max-height:calc(100% - 32px);overflow:auto}
+ #hud b{display:block;margin-bottom:4px} #parts label{display:block;white-space:nowrap} #stamp{opacity:.6;margin-top:4px}
+ #views{position:absolute;top:8px;right:8px;background:var(--panel);padding:6px;border-radius:8px;max-width:calc(100% - 380px)}
+ #views button{margin:2px;font:12px system-ui}
+ #cut{margin-top:6px;display:flex;gap:6px;align-items:center;flex-wrap:wrap}
+ #cut input[type=range]{width:170px} #cutval{min-width:64px;font-variant-numeric:tabular-nums}
+ #sec{position:fixed;inset:0;background:var(--bg);display:none;flex-direction:column;z-index:10}
+ #sec header{display:flex;gap:6px;align-items:center;padding:8px;border-bottom:1px solid #8884;flex-wrap:wrap}
+ #sec header button{font:12px system-ui} #sec header button.on{font-weight:700;outline:2px solid #4a90d9}
+ #sec .body{overflow:auto;flex:1;padding:8px;text-align:center} #sec img{max-width:100%;background:#fff;border-radius:6px}
+ #seclabel{opacity:.75;margin:6px 0}
+ @media (max-width:700px){#views{max-width:none;left:8px;top:auto;bottom:8px} #hud{max-width:60%}}
+</style></head><body>
+<div id="hud"><b id="title">Enclosure</b><div id="parts"></div><div id="stamp"></div></div>
+<div id="views"><span id="vbtns"></span><button id="open2d"></button>
+<div id="cut"><label><input type="checkbox" id="xray"> <span id="t_cut"></span></label>
+<select id="axis"><option value="x">X</option><option value="y" selected>Y</option><option value="z">Z</option></select>
+<input type="range" id="pos" step="0.1"><span id="cutval"></span>
+<label><input type="checkbox" id="flip"> <span id="t_flip"></span></label></div></div>
+<div id="sec"><header><b id="t_sec"></b><span id="tabs"></span><button id="close2d" style="margin-left:auto"></button></header>
+<div class="body"><div id="seclabel"></div><img id="secimg" alt=""></div></div>
+<script type="importmap">{"imports":{"three":"https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js","three/addons/":"https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"}}</script>
+<script type="module">
+import * as THREE from 'three';
+import {OrbitControls} from 'three/addons/controls/OrbitControls.js';
+import {GLTFLoader} from 'three/addons/loaders/GLTFLoader.js';
+const T = {
+  en: {iso:'iso', top:'top', front:'front', back:'back', left:'left', right:'right', bottom:'bottom', sec2d:'2D sections',
+       cut:'section', flip:'flip', close:'close ✕', secTitle:'2D sections', version:'version', noSec:'No sections yet: '},
+  pl: {iso:'izo', top:'góra', front:'przód', back:'tył', left:'lewo', right:'prawo', bottom:'spód', sec2d:'przekroje 2D',
+       cut:'przekrój', flip:'odwróć', close:'zamknij ✕', secTitle:'Przekroje 2D', version:'wersja', noSec:'Brak przekrojów: '}};
+let L = T.en;
+const $ = id => document.getElementById(id);
+function applyLang(lang) {
+  L = T[lang] || T.en; document.documentElement.lang = lang || 'en';
+  $('vbtns').innerHTML = '';
+  for (const v of ['iso','top','front','back','left','right','bottom']) {
+    const b = document.createElement('button'); b.textContent = L[v]; b.onclick = () => setView(v); $('vbtns').append(b); }
+  $('open2d').textContent = L.sec2d; $('t_cut').textContent = L.cut; $('t_flip').textContent = L.flip;
+  $('t_sec').textContent = L.secTitle; $('close2d').textContent = L.close;
+}
+const r = new THREE.WebGLRenderer({antialias:true, preserveDrawingBuffer:true, stencil:true});
+r.setPixelRatio(devicePixelRatio); r.setSize(innerWidth, innerHeight); r.localClippingEnabled = true;
+document.body.appendChild(r.domElement);
+const scene = new THREE.Scene();
+const dark = matchMedia('(prefers-color-scheme: dark)').matches;
+scene.background = new THREE.Color(dark ? 0x1c1d20 : 0xf3f4f6);
+const cam = new THREE.PerspectiveCamera(30, innerWidth/innerHeight, 1, 20000);
+cam.up.set(0,0,1);
+const ctl = new OrbitControls(cam, r.domElement);
+scene.add(new THREE.HemisphereLight(0xffffff, 0x666677, 1.6));
+const dl = new THREE.DirectionalLight(0xffffff, 1.4); dl.position.set(150,-200,300); scene.add(dl);
+const dl2 = new THREE.DirectionalLight(0xffffff, 0.5); dl2.position.set(-200,200,100); scene.add(dl2);
+const clip = new THREE.Plane(new THREE.Vector3(-1,0,0), 0);
+let root = null, stamp = 0, center = new THREE.Vector3(0,0,0), size = 100;
+let RANGES = {x: [-50, 50, 0], y: [-80, 80, 0], z: [-10, 30, 10]};
+function setView(v){
+  const d = size / Math.tan(cam.fov*Math.PI/360) * 1.1, c = center;
+  const P = {iso:[d*.5,-d*.62,d*.6], top:[0,-0.01,d], front:[0,d,d*.15], back:[0,-d,d*.15],
+             left:[-d,0,d*.15], right:[d,0,d*.15], bottom:[0,-0.01,-d]}[v];
+  cam.position.set(c.x+P[0], c.y+P[1], c.z+P[2]); ctl.target.copy(c); ctl.update();
+}
+function setAxis(keepValue) {
+  const [a, b, def] = RANGES[$('axis').value]; $('pos').min = a; $('pos').max = b;
+  if (!keepValue) $('pos').value = def;
+  updateClip();
+}
+function updateClip() {
+  const ax = $('axis').value, v = +$('pos').value, f = $('flip').checked ? 1 : -1;
+  clip.normal.set(ax === 'x' ? f : 0, ax === 'y' ? f : 0, ax === 'z' ? f : 0);
+  clip.constant = -f * v;
+  $('cutval').textContent = ax.toUpperCase() + ' = ' + (Math.abs(v) < 0.05 ? 0 : v).toFixed(1) + ' mm';
+  applyClip($('xray').checked);
+}
+$('xray').onchange = updateClip; $('flip').onchange = updateClip; $('pos').oninput = () => { $('xray').checked = true; updateClip(); };
+$('axis').onchange = () => setAxis(false);
+async function open2d() {
+  const list = await (await fetch('sections/index.json?' + Date.now())).json();
+  const tabs = $('tabs'); tabs.innerHTML = '';
+  const pick = (it, btn) => { $('secimg').src = it.file + '?' + Date.now(); $('seclabel').textContent = it.label || '';
+    tabs.querySelectorAll('button').forEach(b => b.classList.toggle('on', b === btn)); };
+  list.forEach((it, i) => { const b = document.createElement('button'); b.textContent = it.title || String(i + 1);
+    b.onclick = () => pick(it, b); tabs.append(b); if (i === 0) pick(it, b); });
+  $('sec').style.display = 'flex';
+}
+$('open2d').onclick = () => open2d().catch(e => alert(L.noSec + e));
+$('close2d').onclick = () => $('sec').style.display = 'none';
+// ---- section caps (stencil): every opaque part gets a filled cap in its own colour
+let clipOn = false; const caps = [];
+function applyClip(on){ if(!root) return; clipOn = on;
+  root.traverse(o=>{ if(!o.material) return;
+    if (o.userData.stencil) { o.visible = on; return; }
+    o.material.clippingPlanes = on?[clip]:[]; o.material.side = THREE.DoubleSide; o.material.needsUpdate = true; }); }
+function addCaps(obj, color, idx) {
+  const ro = idx * 3 + 1, meshes = [];
+  obj.traverse(o => { if (o.isMesh) meshes.push(o); });
+  for (const o of meshes) {
+    o.renderOrder = 1000;
+    for (const [side, op] of [[THREE.BackSide, THREE.IncrementWrapStencilOp], [THREE.FrontSide, THREE.DecrementWrapStencilOp]]) {
+      const m = new THREE.MeshBasicMaterial({depthWrite: false, depthTest: false, colorWrite: false, stencilWrite: true,
+        stencilFunc: THREE.AlwaysStencilFunc, side, clippingPlanes: [clip], stencilFail: op, stencilZFail: op, stencilZPass: op});
+      const sm = new THREE.Mesh(o.geometry, m); sm.userData.stencil = true; sm.renderOrder = ro; sm.visible = clipOn; o.add(sm);
+    }
+  }
+  const pm = new THREE.MeshStandardMaterial({color: color.clone().multiplyScalar(0.85), metalness: 0.0, roughness: 0.8,
+    stencilWrite: true, stencilRef: 0, stencilFunc: THREE.NotEqualStencilFunc,
+    stencilFail: THREE.ReplaceStencilOp, stencilZFail: THREE.ReplaceStencilOp, stencilZPass: THREE.ReplaceStencilOp});
+  const cap = new THREE.Mesh(new THREE.PlaneGeometry(5000, 5000), pm);
+  cap.onAfterRender = rr => rr.clearStencil(); cap.renderOrder = ro + 1.1;
+  scene.add(cap); caps.push({cap, obj});
+}
+function updateCaps() {
+  for (const c of caps) {
+    c.cap.visible = clipOn && c.obj.visible;
+    if (!c.cap.visible) continue;
+    clip.coplanarPoint(c.cap.position);
+    c.cap.lookAt(c.cap.position.x - clip.normal.x, c.cap.position.y - clip.normal.y, c.cap.position.z - clip.normal.z);
+  }
+}
+const cacheG = {};
+async function load(first){
+  const meta = await (await fetch('scene.json?'+Date.now())).json();
+  if (meta.stamp === stamp) return; stamp = meta.stamp;
+  if (first) applyLang(meta.lang);
+  const grp = new THREE.Group();
+  for (const c of caps) scene.remove(c.cap); caps.length = 0;
+  let capIdx = 0;
+  const vis = {}; document.querySelectorAll('#parts input').forEach(cb => vis[cb.dataset.name] = cb.checked);
+  const partsDiv = $('parts'); partsDiv.innerHTML = '';
+  for (const p of meta.parts) {
+    const key = p.file + '@' + p.v;
+    if (!cacheG[key]) cacheG[key] = await new GLTFLoader().loadAsync(p.file + '?v=' + p.v);
+    const obj = cacheG[key].scene.clone(true);
+    const col = new THREE.Color(...p.color);
+    obj.traverse(o => { if (o.isMesh) { o.material = new THREE.MeshStandardMaterial({color: col, metalness: 0.05, roughness: 0.55,
+        transparent: p.opacity < 1, opacity: p.opacity, depthWrite: p.opacity >= 1, side: THREE.DoubleSide}); }});
+    obj.visible = (p.name in vis) ? vis[p.name] : p.visible;          // keep user's toggles across reloads
+    grp.add(obj);
+    if (p.opacity >= 1) addCaps(obj, col, capIdx++);
+    const l = document.createElement('label'); const cb = document.createElement('input'); cb.type='checkbox';
+    cb.checked = obj.visible; cb.dataset.name = p.name;
+    cb.onchange = () => obj.visible = cb.checked; l.append(cb, ' ' + p.label); partsDiv.append(l);
+  }
+  const bb0 = new THREE.Box3().setFromObject(grp); if (bb0.getSize(new THREE.Vector3()).length() < 5) grp.scale.setScalar(1000);
+  grp.rotation.set(Math.PI/2, 0, 0);   // glTF is Y-up (metres) -> model Z-up (mm)
+  grp.updateMatrixWorld(true);
+  if (root) scene.remove(root); root = grp; scene.add(root);
+  if (meta.bbox) {
+    const [x0,y0,z0,x1,y1,z1] = meta.bbox, m = 2;
+    RANGES = {x:[x0-m, x1+m, (x0+x1)/2], y:[y0-m, y1+m, (y0+y1)/2], z:[z0-m, z1+m, (z0+z1)/2]};
+    if (first) { center.set((x0+x1)/2, (y0+y1)/2, (z0+z1)/2); size = Math.hypot(x1-x0, y1-y0, z1-z0) / 2; }
+    setAxis(!first);
+  }
+  $('title').textContent = meta.title || 'Enclosure'; document.title = meta.title || 'Enclosure preview';
+  $('stamp').textContent = L.version + ': ' + new Date(meta.stamp*1000).toLocaleTimeString();
+  applyClip($('xray').checked);
+  if (first) setView(meta.view || 'iso');
+}
+applyLang('en');
+load(true).catch(e => $('stamp').textContent = 'scene.json: ' + e);
+setInterval(()=>load(false).catch(()=>{}), 1500);
+addEventListener('resize', ()=>{ cam.aspect = innerWidth/innerHeight; cam.updateProjectionMatrix(); r.setSize(innerWidth, innerHeight); });
+(function loop(){ requestAnimationFrame(loop); updateCaps(); r.render(scene, cam); })();
+Object.assign(window, {setView, open2d, cam, ctl, THREE});
+window.clipAt = (nx,ny,nz,d) => { clip.normal.set(nx,ny,nz); clip.constant = d; $('xray').checked = true; applyClip(true); };
+window.cutAt = (ax, v, flip=false) => { $('axis').value = ax; $('flip').checked = flip; setAxis(true); $('pos').value = v; $('xray').checked = true; updateClip(); };
+window.noClip = () => { $('xray').checked = false; applyClip(false); };
+window.look = (px,py,pz,tx,ty,tz) => { cam.position.set(px,py,pz); ctl.target.set(tx,ty,tz); ctl.update(); };
+window.show = (label, on) => { document.querySelectorAll('#parts label').forEach(l => { if (l.textContent.trim() === label) { const cb = l.querySelector('input'); if (cb.checked !== on) cb.click(); } }); };
+</script></body></html>
